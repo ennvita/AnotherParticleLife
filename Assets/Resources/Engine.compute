@@ -1,0 +1,157 @@
+#pragma kernel move_particles_batched
+//#pragma enable_d3d11_debug_symbols 
+
+#include "C:\Program Files\Unity\Hub\Editor\2022.3.16f1\Editor\Data\CGIncludes\UnityCG.cginc"
+
+struct Particle
+{
+    float2 position;
+    float2 velocity;
+    float2 force;  // integer to allow for InterlockedAdd
+    uint c;
+    int domain;
+    int active;
+    // add uint # of neighbors
+};
+
+RWStructuredBuffer<uint> counts;
+RWStructuredBuffer<uint> offsets;
+RWStructuredBuffer<Particle> particles;
+
+uint _particleCount;
+float BETA;
+float R_MAX;
+float FORCE_FACTOR;
+float FRICTION;
+
+float mapWidth;
+float mapHeight;
+
+RWStructuredBuffer<float> interactionMatrix;
+
+int numDomainsX;
+int numDomainsY;
+
+float compute_force(float r, float a)
+{
+    if (r < BETA)
+    {
+        return r / BETA - 1;
+    }
+    else if ((BETA < r) && (r < 1))
+    {
+        return a * (1 - abs(2 * r - 1 - BETA)) / (1 - BETA);
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+[numthreads(128, 1, 1)]
+void move_particles_batched(uint3 id : SV_DispatchThreadID) // thread group unique ID
+{
+    if (id.x > _particleCount)
+        return;
+    
+    uint d, d11, d12, d13, d21, d23, d31, d32, d33;
+    
+    int _d1, _d2, dx, dy;
+    
+    // find current domain
+    dx = floor(particles[id.x].position.x / R_MAX);
+    dy = floor(particles[id.x].position.y / R_MAX);
+    
+    // find neighboring domains
+    d = (dy - 0) * numDomainsX + dx + 0 + 1; // + 1 to offset for cumulative sum indexing
+    d11 = (dy - 1) * numDomainsX + dx - 1 + 1;
+    d12 = (dy - 1) * numDomainsX + dx - 0 + 1;
+    d13 = (dy - 1) * numDomainsX + dx + 1 + 1;
+    d21 = (dy - 0) * numDomainsX + dx - 1 + 1;
+    d23 = (dy - 0) * numDomainsX + dx + 1 + 1;
+    d31 = (dy + 1) * numDomainsX + dx - 1 + 1;
+    d32 = (dy + 1) * numDomainsX + dx - 0 + 1;
+    d33 = (dy + 1) * numDomainsX + dx + 1 + 1;
+    
+    uint neighborDomains[9] = { d, d11, d12, d13, d21, d23, d31, d32, d33 };
+    
+    float rx;
+    float ry;
+    float r;
+    float f_mag;
+    float2 f;
+    float a;
+    
+    f.x = 0;
+    f.y = 0;
+    
+    int m = numDomainsX * numDomainsY;
+
+    [unroll]
+    for (int k = 0; k < 9; k++)
+    {
+        // offsetBuffer is a cumulative sum of the number of particles in each bin
+        // since particlesBuffer has now been sorted, offsetBuffer[domain_index] should
+        // provide the starting index to particlesBuffer for the particles in the specified domain
+        
+        // - 1 again since the start index should be the number of particles
+        // contained in all bins _except_ your own
+        
+        // modulo stuff to handle negatives safely
+        _d1 = (((neighborDomains[k] - 1) % m) + m) % m;
+        _d2 = (((neighborDomains[k] - 1 + 1) % m) + m) % m;
+        
+        for (int j = offsets[_d1]; j < offsets[_d2]; j++)
+        {
+            if (id.x == j)
+                continue;
+            
+            rx = particles[j].position.x - particles[id.x].position.x;
+            ry = particles[j].position.y - particles[id.x].position.y;
+            
+            // PBC stuff
+            if (rx > 0.5 * mapWidth)
+                rx -= mapWidth;
+            if (rx <= -0.5 * mapWidth)
+                rx += mapWidth;
+            if (ry > 0.5 * mapHeight)
+                ry -= mapHeight;
+            if (ry <= -0.5 * mapHeight)
+                ry += mapHeight;
+            
+            r = sqrt(rx * rx + ry * ry);
+            
+            if ((r > 0) && (r <= R_MAX)) // this is where a particle is within the interaction radius
+            {
+                a = interactionMatrix[particles[id.x].c * 6 + particles[j].c];
+                f_mag = compute_force(r / R_MAX, a);
+                    
+                f.x += f_mag * rx / r;
+                f.y += f_mag * ry / r;
+            }
+        }
+    }
+
+    particles[id.x].force = f * R_MAX * FORCE_FACTOR;
+    
+    f_mag = particles[id.x].force.x * particles[id.x].force.x + particles[id.x].force.y * particles[id.x].force.y;
+    if (f_mag > 1000.0)
+    {  // clipping maximium value to prevent heavy clustering
+        particles[id.x].force.x = particles[id.x].force.x / f_mag * 1000;
+        particles[id.x].force.y = particles[id.x].force.y / f_mag * 1000;
+    }
+    
+    particles[id.x].velocity *= FRICTION;
+    particles[id.x].velocity += particles[id.x].force * unity_DeltaTime[0];
+    particles[id.x].position += particles[id.x].velocity * unity_DeltaTime[0];
+    
+    // wrap atoms
+    if (particles[id.x].position.x < 0)
+        particles[id.x].position.x += mapWidth;
+    if (particles[id.x].position.x > mapWidth)
+        particles[id.x].position.x -= mapWidth;
+    if (particles[id.x].position.y < 0)
+        particles[id.x].position.y += mapHeight;
+    if (particles[id.x].position.y > mapHeight)
+        particles[id.x].position.y -= mapHeight;
+}
